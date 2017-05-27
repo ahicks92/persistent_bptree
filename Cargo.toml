@@ -1,0 +1,6 @@
+[package]
+name = "persistent_bptree"
+version = "0.1.0"
+authors = ["Austin Hicks <camlorn@camlorn.net>"]
+
+[dependencies]
