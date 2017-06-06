@@ -7,3 +7,4 @@ authors = ["Austin Hicks <camlorn@camlorn.net>"]
 serde = "1.0"
 serde_derive = "1.0"
 bincode = "0.8.0"
+take_mut = "0.1.3"
