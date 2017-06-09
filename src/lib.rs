@@ -8,6 +8,7 @@ extern crate take_mut;
 use std::io;
 use std::error::Error;
 use std::marker::PhantomData;
+use std::cell;
 
 
 #[derive(Debug)]
@@ -44,39 +45,42 @@ fn encode<O: serde::Serialize, W: io::Write+io::Seek>(writer: &mut W, obj: &O) -
     }).map(|_| offset)
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Ord, PartialOrd, Eq, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
 enum NodeType {
     Root,
     Internal,
     Leaf
 }
 
-enum NodeRef<K> {
+enum NodeRefInternal<K> {
     Unloaded(u64),
     Loaded(Box<Node<K>>),
-    Modified(Box<Node<K>>),
 }
+
+struct NodeRef<K>(cell::UnsafeCell<NodeRefInternal<K>>);
 
 // An on-disk representation, for space saving.
 #[derive(Serialize, Deserialize)]
 struct DiskNode<K> {
     node_type: NodeType,
-    children: Vec<(K, u64)>,
-    after_last: u64,
+    keys: Vec<K>,
+    children: Vec<u64>,
 }
 
 struct Node<K> {
     node_type: NodeType,
-    children: Vec<(K, NodeRef<K>)>,
-    after_last: NodeRef<K>,
+    keys: Vec<K>,
+    children: Vec<NodeRef<K>>,
+    modified: bool,
 }
 
-impl<K> From<DiskNode<K>> for Node<K> {
+impl<K: serde::de::DeserializeOwned> From<DiskNode<K>> for Node<K> {
     fn from(obj: DiskNode<K>) -> Node<K> {
         Node {
             node_type: obj.node_type,
-            children: obj.children.into_iter().map(|x| (x.0, NodeRef::Unloaded(x.1))).collect(),
-            after_last: NodeRef::Unloaded(obj.after_last),
+            keys: obj.keys,
+            children: obj.children.into_iter().map(|x| (NodeRef::from_offset(x))).collect(),
+            modified: false,
         }
     }
 }
@@ -87,80 +91,82 @@ impl<K: serde::de::DeserializeOwned> DiskNode<K> {
     }
 }
 
+fn load<K: serde::de::DeserializeOwned, R: io::Read+io::Seek>(reader: &mut R, offset: u64) -> Result<Node<K>, DecodingError> {
+    Ok(DiskNode::<K>::load(reader, offset)?.into())
+}
+
 impl<K: serde::de::DeserializeOwned> NodeRef<K> {
-    fn load<R: io::Read+io::Seek>(reader: &mut R, offset: u64) -> Result<Node<K>, DecodingError> {
-        Ok(DiskNode::<K>::load(reader, offset)?.into())
+    fn from_offset(offset: u64) -> NodeRef<K> {
+        NodeRef(cell::UnsafeCell::new(NodeRefInternal::Unloaded(offset)))
     }
 
-    // Upgrade through the variants, optionally all the way to mutable.
-    fn upgrade<R: io::Read+io::Seek>(&mut self, reader: &mut R, modification: bool) -> Result<(), DecodingError> {
-        let new: Option<Box<Node<K>>> = match *self {
-            NodeRef::Unloaded(offset) => Some(Box::new(NodeRef::load(reader, offset)?)),
-            _ => None,
-        };
-        // If we have a new one, construct the appropriate variant directly.
-        if let Some(b)  = new {
-            if modification {
-                *self = NodeRef::Modified(b);
-            } else {
-                *self = NodeRef::Loaded(b);
+    fn load<R: io::Read+io::Seek>(&self, reader: &mut R) -> Result<(), DecodingError> {
+        let internal = self.0.get();
+        unsafe {
+            if let NodeRefInternal::Unloaded(offset) = *internal {
+                *internal = NodeRefInternal::Loaded(Box::new(load(reader, offset)?));
             }
-            return Ok(());
-        }
-        // If we get here, it's either Loaded or Modified, with a possible need for an upgrade.
-        if modification {
-            take_mut::take(self, |x| match x {
-                NodeRef::Loaded(b) | NodeRef::Modified(b) => NodeRef::Modified(b),
-                _ => panic!("The node should be loaded."),
-            });
         }
         Ok(())
     }
 
-    fn examine<R: io::Read+io::Seek>(&mut self, reader: &mut R) -> Result<&mut Node<K>, DecodingError> {
-        self.upgrade(reader, false)?;
-        Ok(match *self {
-            NodeRef::Loaded(ref mut n) => n,
-            NodeRef::Modified(ref mut n) => n,
-            _ => panic!("Nodes should be loaded."),
-        })
+    fn get<R: io::Read+io::Seek>(&self, reader: &mut R) -> Result<&Node<K>, DecodingError> {
+        self.load(reader)?;
+        unsafe {
+            Ok(match *self.0.get() {
+                NodeRefInternal::Loaded(ref n) => n,
+                _ => panic!("Nodes should be loaded."),
+            })
+        }
     }
 
-    fn modify<R: io::Read+io::Seek>(&mut self, reader: &mut R) -> Result<&mut Node<K>, DecodingError> {
-        self.upgrade(reader, true)?;
-        Ok(match *self {
-            NodeRef::Modified(ref mut n) => n,
-            _ => panic!("Nodes should be modified."),
-        })
+    fn get_mut<R: io::Read+io::Seek>(&mut self, reader: &mut R) -> Result<&mut Node<K>, DecodingError> {
+        self.load(reader)?;
+        unsafe {
+            Ok(match *self.0.get() {
+                NodeRefInternal::Loaded(ref mut n) => {
+                    n.modified = true;
+                    n
+                },
+                _ => panic!("Node not loaded."),
+            })
+        }
+    }
+
+    fn offset_or_panic(&self, msg: &'static str) -> u64 {
+        let internal = self.0.get();
+        unsafe {
+            match *internal {
+                NodeRefInternal::Unloaded(offset) => offset,
+                _ => panic!(msg),
+            }
+        }
     }
 }
 
 impl<K: serde::de::DeserializeOwned+Eq+Ord> Node<K> {
-    fn find_offset_for<R: io::Read+io::Seek>(&mut self, reader: &mut R, key: &K) -> Result<Option<u64>, DecodingError> {
-        // If we're the root and there are no children, this is the empty tree.
-        if self.node_type == NodeType::Root && self.children.len() == 0 { Ok(None) }
-        else if self.node_type == NodeType::Leaf {
-            match self.children.binary_search_by_key(&key, |x| &x.0) {
-                Ok(ind) => Ok(Some(match self.children[ind].1 {
-                    NodeRef::Unloaded(offset) => offset,
-                    _ => panic!("This is supposed to be a leaf, but the child is somehow loaded.")
-                })),
+    fn find_offset_for<R: io::Read+io::Seek>(&self, reader: &mut R, key: &K) -> Result<Option<u64>, DecodingError> {
+        if self.node_type == NodeType::Leaf {
+            if self.children.len() == 0 { return Ok(None) } //empty tree.
+            match self.keys.binary_search(key) {
+                Ok(ind) => Ok(Some(self.children[ind].offset_or_panic("This is a leaf, but somehow has a loaded child."))),
                 Err(_) => Ok(None),
             }
         }
         else {
-            self.step_toward(key).examine(reader)?.find_offset_for(reader, key)
+            self.children[self.index_of(key)].get(reader)?.find_offset_for(reader, key)
         }
     }
 
-    fn step_toward(&mut self, key: &K) -> &mut NodeRef<K> {
+    fn index_of(&self, key: &K) -> usize{
         assert!(self.node_type != NodeType::Leaf);
-        let ind = self.children.binary_search_by_key(&key, |x| &x.0);
+        let ind = self.keys.binary_search(key);
+        // Explanation: this returns the index of the child to the right of the last key smaller than key.
+        // In this implementation, before is <= and after is >.
+        // Before is the index of the key, after is the index of the key+1.
+        // The not found case of binary_search is the key+1.
         match ind {
-            // Each subtree <= the key.
-            Ok(index) => &mut self.children[index].1,
-            Err(index) =>
-                if index == self.children.len() { &mut self.after_last } else { &mut self.children[index+1].1 },
+            Ok(index) | Err(index) => index,
         }
     }
 }
@@ -177,6 +183,6 @@ impl<'a, R: io::Read+io::Seek, K: serde::de::DeserializeOwned+Eq+Ord, V> BPTree<
     }
 
     pub fn offset_for(&mut self, key: &K) -> Result<Option<u64>, DecodingError> {
-        self.root_reference.examine(self.backing_io)?.find_offset_for(self.backing_io, key)
+        self.root_reference.get(self.backing_io)?.find_offset_for(self.backing_io, key)
     }
 }
