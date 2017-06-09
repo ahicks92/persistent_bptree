@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 extern crate serde;
 #[macro_use]
 extern crate serde_derive;
@@ -87,7 +88,6 @@ impl<K: serde::de::DeserializeOwned> DiskNode<K> {
 }
 
 impl<K: serde::de::DeserializeOwned> NodeRef<K> {
-
     fn load<R: io::Read+io::Seek>(reader: &mut R, offset: u64) -> Result<Node<K>, DecodingError> {
         Ok(DiskNode::<K>::load(reader, offset)?.into())
     }
@@ -127,7 +127,7 @@ impl<K: serde::de::DeserializeOwned> NodeRef<K> {
     }
 
     fn modify<R: io::Read+io::Seek>(&mut self, reader: &mut R) -> Result<&mut Node<K>, DecodingError> {
-        self.upgrade(reader, true);
+        self.upgrade(reader, true)?;
         Ok(match *self {
             NodeRef::Modified(ref mut n) => n,
             _ => panic!("Nodes should be modified."),
@@ -138,35 +138,32 @@ impl<K: serde::de::DeserializeOwned> NodeRef<K> {
 impl<K: serde::de::DeserializeOwned+Eq+Ord> Node<K> {
     fn find_offset_for<R: io::Read+io::Seek>(&mut self, reader: &mut R, key: &K) -> Result<Option<u64>, DecodingError> {
         // If we're the root and there are no children, this is the empty tree.
-        if self.node_type == NodeType::Root && self.children.len() == 0 { return Ok(None) }
-        let index = self.children.binary_search_by_key(&key, |x| &x.0);
-        let mut reference;
-        match index {
-            Ok(ind) if self.node_type == NodeType::Leaf => {
-                let r = &self.children[ind].1;
-                match *r {
-                    NodeRef::Unloaded(offset) => return Ok(Some(offset)),
-                    _ => panic!("Tree contains leaf inside leaf."),
-                }
-            }
-            // The right subtree is >, the left subtree is <=.
-            // The vector stores the offset of the left subtree.
-            Ok(ind) => {
-                reference = &mut self.children[ind].1;
-            }
-            Err(ind) => {
-                // Recall that empty nodes are not possible.
-                if ind < self.children.len() {
-                    reference = &mut self.children[ind].1;
-                } else {
-                    reference = &mut self.after_last;
-                }
+        if self.node_type == NodeType::Root && self.children.len() == 0 { Ok(None) }
+        else if self.node_type == NodeType::Leaf {
+            match self.children.binary_search_by_key(&key, |x| &x.0) {
+                Ok(ind) => Ok(Some(match self.children[ind].1 {
+                    NodeRef::Unloaded(offset) => offset,
+                    _ => panic!("This is supposed to be a leaf, but the child is somehow loaded.")
+                })),
+                Err(_) => Ok(None),
             }
         }
-        reference.examine(reader)?.find_offset_for(reader, key)
+        else {
+            self.step_toward(key).examine(reader)?.find_offset_for(reader, key)
+        }
+    }
+
+    fn step_toward(&mut self, key: &K) -> &mut NodeRef<K> {
+        assert!(self.node_type != NodeType::Leaf);
+        let ind = self.children.binary_search_by_key(&key, |x| &x.0);
+        match ind {
+            // Each subtree <= the key.
+            Ok(index) => &mut self.children[index].1,
+            Err(index) =>
+                if index == self.children.len() { &mut self.after_last } else { &mut self.children[index+1].1 },
+        }
     }
 }
-
 
 struct BPTree<'a, R: 'a, K, V> {
     root_reference: NodeRef<K>,
