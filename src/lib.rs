@@ -150,7 +150,7 @@ impl<K> Drop for NodeRef<K> {
     }
 }
 
-impl<K: serde::de::DeserializeOwned+Eq+Ord> Node<K> {
+impl<K: serde::de::DeserializeOwned+Eq+Ord+Clone> Node<K> {
     fn find_offset_for<R: io::Read+io::Seek>(&self, reader: &mut R, key: &K) -> Result<Option<u64>, DecodingError> {
         if self.node_type == NodeType::Leaf {
             if self.children.len() == 0 { return Ok(None) } //empty tree.
@@ -175,6 +175,45 @@ impl<K: serde::de::DeserializeOwned+Eq+Ord> Node<K> {
             Ok(index) | Err(index) => index,
         }
     }
+
+    /// Modify this node in place to split in half, returning the upper half.
+    fn split_in_place(&mut self) -> (K, Box<Node<K>>) {
+        // Doing this based off keys is important.
+        let half = self.keys.len()/2;
+        let upper_keys = self.keys.drain(half..).collect::<Vec<_>>();
+        let upper_children = self.children.drain(half..).collect::<Vec<_>>();
+        assert!(self.children.len() > 1);
+        assert!(self.keys.len() > 1);
+        assert!(upper_children.len() > 1);
+        assert!(upper_keys.len() > 1);
+        let ret_key;
+        let ret_node;
+        match self.node_type {
+            NodeType::Leaf => {
+                ret_key = self.keys.last().unwrap().clone();
+                ret_node = Node {
+                    keys: upper_keys,
+                    children: upper_children,
+                    node_type: NodeType::Leaf,
+                    modified: true,
+                };
+            }
+            NodeType::Root | NodeType::Internal => {
+                // A split of the root makes us an internal, and something else will construct the new root.
+                self.node_type = NodeType::Internal;
+                // We have one extra key in ourself right now. This is greater than any value beneath us.
+                // In this implementation we go left for <=.
+                ret_key = self.keys.pop().unwrap();
+                ret_node = Node {
+                    node_type: NodeType::Internal,
+                    keys: upper_keys,
+                    children: upper_children,
+                    modified: true,
+                }
+            }
+        }
+        (ret_key, Box::new(ret_node))
+    }
 }
 
 struct BPTree<'a, R: 'a, K, V> {
@@ -183,7 +222,7 @@ struct BPTree<'a, R: 'a, K, V> {
     _phantom: PhantomData<V>
 }
 
-impl<'a, R: io::Read+io::Seek, K: serde::de::DeserializeOwned+Eq+Ord, V> BPTree<'a, R, K, V> {
+impl<'a, R: io::Read+io::Seek, K: serde::de::DeserializeOwned+Eq+Ord+Clone, V> BPTree<'a, R, K, V> {
     pub fn contains(&mut self, key: &K) -> Result<bool, DecodingError> {
         Ok(self.offset_for(key)?.is_some())
     }
