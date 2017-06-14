@@ -144,6 +144,12 @@ impl<K: serde::de::DeserializeOwned> NodeRef<K> {
     }
 }
 
+impl<K> Drop for NodeRef<K> {
+    fn drop(&mut self) {
+        unsafe { std::ptr::drop_in_place(self.0.get()); }
+    }
+}
+
 impl<K: serde::de::DeserializeOwned+Eq+Ord> Node<K> {
     fn find_offset_for<R: io::Read+io::Seek>(&self, reader: &mut R, key: &K) -> Result<Option<u64>, DecodingError> {
         if self.node_type == NodeType::Leaf {
