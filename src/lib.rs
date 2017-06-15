@@ -146,6 +146,17 @@ impl<K: serde::de::DeserializeOwned> NodeRef<K> {
             }
         }
     }
+
+    fn into_box<R: Read+Seek>(self, reader: &mut R) -> Result<Box<Node<K>>, DecodingError> {
+        self.load(reader)?;
+        let old = unsafe {
+            std::mem::replace(&mut *self.0.get(), NodeRefInternal::Unloaded(0))
+        };
+        match old {
+            NodeRefInternal::Loaded(n) => Ok(n),
+            _ => panic!("Somehow, this is an unloaded node."),
+        }
+    }
 }
 
 impl<K> Drop for NodeRef<K> {
@@ -248,20 +259,59 @@ impl<K: serde::de::DeserializeOwned+Eq+Ord+Clone> Node<K> {
         }
         else { Ok(None) }   
     }
+
+    /// If the root splits, sets our type to internal and/or leaf depending, then returns the new sibling.
+    fn insert<R: Read+Seek>(&mut self, reader: &mut R, key: &K, value: u64, order: u64) -> Result<Option<(K, Box<Node<K>>)>, DecodingError> {
+        let split_threshold = (order/2+order%2) as usize;
+        let target = self.index_of(key);
+        let needs_split = self.children[target].get_mut(reader)?.insert_nonroot(reader, key, value, split_threshold)?;
+        if let Some((k, n)) = needs_split {
+            // Same as insert_nonroot.
+            self.keys.insert(target, k);
+            self.children.insert(target+1, NodeRef::from_boxed_node(n));
+        }
+        if self.children.len() > split_threshold {
+            let new_type = match self.node_type {
+                NodeType::Leaf => NodeType::Leaf,
+                NodeType::Root => NodeType::Internal,
+                _ => panic!("Should be a root or a lweaf."),
+            };
+            self.node_type = new_type;
+            Ok(Some(self.split_in_place()))
+        }
+        else { Ok(None) }
+    }
 }
 
-struct BPTree<'a, R: 'a, K, V> {
+struct BPOffsetTree<'a, R: 'a, K> {
     root_reference: NodeRef<K>,
     backing_io: &'a mut R,
-    _phantom: PhantomData<V>
+    order: u64,
 }
 
-impl<'a, R: Read+Seek, K: serde::de::DeserializeOwned+Eq+Ord+Clone, V> BPTree<'a, R, K, V> {
-    pub fn contains(&mut self, key: &K) -> Result<bool, DecodingError> {
+impl<'a, R: Read+Seek, K: serde::de::DeserializeOwned+Eq+Ord+Clone> BPOffsetTree<'a, R, K> {
+    fn contains(&mut self, key: &K) -> Result<bool, DecodingError> {
         Ok(self.offset_for(key)?.is_some())
     }
 
-    pub fn offset_for(&mut self, key: &K) -> Result<Option<u64>, DecodingError> {
+    fn offset_for(&mut self, key: &K) -> Result<Option<u64>, DecodingError> {
         self.root_reference.get(self.backing_io)?.find_offset_for(self.backing_io, key)
+    }
+
+    fn insert(&mut self, key: &K, value: u64) -> Result<(), DecodingError> {
+        let needs_split = self.root_reference.get_mut(self.backing_io)?.insert(&mut self.backing_io, key, value, self.order)?;
+        if let Some((k, right)) = needs_split {
+            // This is a hack to get around moving out.
+            let r = std::mem::replace(&mut self.root_reference, NodeRef::from_offset(0));
+            let left = r.into_box(self.backing_io)?;
+            let new_node = Node {
+                node_type: NodeType::Root,
+                modified: true,
+                keys: vec![k],
+                children: vec![NodeRef::from_boxed_node(left), NodeRef::from_boxed_node(right)],
+            };
+            self.root_reference = NodeRef::from_boxed_node(Box::new(new_node));
+        }        
+        Ok(())
     }
 }
