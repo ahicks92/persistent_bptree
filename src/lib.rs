@@ -5,7 +5,7 @@ extern crate serde_derive;
 extern crate bincode;
 extern crate take_mut;
 
-use std::io;
+use std::io::{self, Read, Seek, Write};
 use std::error::Error;
 use std::marker::PhantomData;
 use std::cell;
@@ -17,7 +17,7 @@ pub enum DecodingError {
     IoError(io::Error),
 }
 
-fn decode<O: serde::de::DeserializeOwned, R: io::Read+io::Seek>(reader: &mut R, offset: u64) -> Result<O, DecodingError> {
+fn decode<O: serde::de::DeserializeOwned, R: Read+Seek>(reader: &mut R, offset: u64) -> Result<O, DecodingError> {
     reader.seek(io::SeekFrom::Start(offset)).map_err(|x| DecodingError::IoError(x))?;
     bincode::deserialize_from(    reader, bincode::Infinite)
     .map_err(|x| {
@@ -34,7 +34,7 @@ pub enum EncodingError {
     IoError(io::Error),
 }
 
-fn encode<O: serde::Serialize, W: io::Write+io::Seek>(writer: &mut W, obj: &O) -> Result<u64, EncodingError> {
+fn encode<O: serde::Serialize, W: Write+Seek>(writer: &mut W, obj: &O) -> Result<u64, EncodingError> {
     let offset = writer.seek(io::SeekFrom::End(0)).map_err(|x| EncodingError::IoError(x))?;
     bincode::serialize_into(writer, obj, bincode::Infinite)
     .map_err(|x| {
@@ -86,12 +86,12 @@ impl<K: serde::de::DeserializeOwned> From<DiskNode<K>> for Node<K> {
 }
 
 impl<K: serde::de::DeserializeOwned> DiskNode<K> {
-    fn load<R: io::Read+io::Seek>(reader: &mut R, offset: u64) -> Result<DiskNode<K>, DecodingError> {
+    fn load<R: Read+Seek>(reader: &mut R, offset: u64) -> Result<DiskNode<K>, DecodingError> {
         decode(reader, offset)        
     }
 }
 
-fn load<K: serde::de::DeserializeOwned, R: io::Read+io::Seek>(reader: &mut R, offset: u64) -> Result<Node<K>, DecodingError> {
+fn load<K: serde::de::DeserializeOwned, R: Read+Seek>(reader: &mut R, offset: u64) -> Result<Node<K>, DecodingError> {
     Ok(DiskNode::<K>::load(reader, offset)?.into())
 }
 
@@ -100,7 +100,11 @@ impl<K: serde::de::DeserializeOwned> NodeRef<K> {
         NodeRef(cell::UnsafeCell::new(NodeRefInternal::Unloaded(offset)))
     }
 
-    fn load<R: io::Read+io::Seek>(&self, reader: &mut R) -> Result<(), DecodingError> {
+    fn from_boxed_node(node: Box<Node<K>>) -> NodeRef<K> {
+        NodeRef(cell::UnsafeCell::new(NodeRefInternal::Loaded(node)))
+    }
+
+    fn load<R: Read+Seek>(&self, reader: &mut R) -> Result<(), DecodingError> {
         let internal = self.0.get();
         unsafe {
             if let NodeRefInternal::Unloaded(offset) = *internal {
@@ -110,7 +114,7 @@ impl<K: serde::de::DeserializeOwned> NodeRef<K> {
         Ok(())
     }
 
-    fn get<R: io::Read+io::Seek>(&self, reader: &mut R) -> Result<&Node<K>, DecodingError> {
+    fn get<R: Read+Seek>(&self, reader: &mut R) -> Result<&Node<K>, DecodingError> {
         self.load(reader)?;
         unsafe {
             Ok(match *self.0.get() {
@@ -120,7 +124,7 @@ impl<K: serde::de::DeserializeOwned> NodeRef<K> {
         }
     }
 
-    fn get_mut<R: io::Read+io::Seek>(&mut self, reader: &mut R) -> Result<&mut Node<K>, DecodingError> {
+    fn get_mut<R: Read+Seek>(&mut self, reader: &mut R) -> Result<&mut Node<K>, DecodingError> {
         self.load(reader)?;
         unsafe {
             Ok(match *self.0.get() {
@@ -151,7 +155,7 @@ impl<K> Drop for NodeRef<K> {
 }
 
 impl<K: serde::de::DeserializeOwned+Eq+Ord+Clone> Node<K> {
-    fn find_offset_for<R: io::Read+io::Seek>(&self, reader: &mut R, key: &K) -> Result<Option<u64>, DecodingError> {
+    fn find_offset_for<R: Read+Seek>(&self, reader: &mut R, key: &K) -> Result<Option<u64>, DecodingError> {
         if self.node_type == NodeType::Leaf {
             if self.children.len() == 0 { return Ok(None) } //empty tree.
             match self.keys.binary_search(key) {
@@ -176,7 +180,7 @@ impl<K: serde::de::DeserializeOwned+Eq+Ord+Clone> Node<K> {
         }
     }
 
-    /// Modify this node in place to split in half, returning the upper half.
+    /// Modify this node in place to split in half, returning the upper half and the dividing key.
     fn split_in_place(&mut self) -> (K, Box<Node<K>>) {
         // Doing this based off keys is important.
         let half = self.keys.len()/2;
@@ -214,6 +218,34 @@ impl<K: serde::de::DeserializeOwned+Eq+Ord+Clone> Node<K> {
         }
         (ret_key, Box::new(ret_node))
     }
+
+    fn insert_nonroot<R: Read+Seek>(&mut self, reader: &mut R, key: &K, value: u64, split_threshold: usize)
+        -> Result<Option<(K, Box<Node<K>>)>, DecodingError>
+    {
+        assert!(self.node_type != NodeType::Root);
+        let target = self.index_of(key);
+        if self.node_type == NodeType::Leaf {
+            if &self.keys[target] == key {
+                self.children[target] = NodeRef::from_offset(value);
+            }
+            else {
+                self.keys.insert(target, key.clone());
+                self.children.insert(target, NodeRef::from_offset(value));
+            }
+        }
+        else {
+            let needs_split = self.children[target].get_mut(reader)?.insert_nonroot(reader, key, value, split_threshold)?;
+            if let Some((k, n)) = needs_split {
+                self.keys.insert(target, k);
+                self.children.insert(target, NodeRef::from_boxed_node(n));
+            }
+        }
+        if self.children.len() > split_threshold {
+            Ok(Some(self.split_in_place()))
+        }
+        else { Ok(None) }   
+    }
+
 }
 
 struct BPTree<'a, R: 'a, K, V> {
@@ -222,7 +254,7 @@ struct BPTree<'a, R: 'a, K, V> {
     _phantom: PhantomData<V>
 }
 
-impl<'a, R: io::Read+io::Seek, K: serde::de::DeserializeOwned+Eq+Ord+Clone, V> BPTree<'a, R, K, V> {
+impl<'a, R: Read+Seek, K: serde::de::DeserializeOwned+Eq+Ord+Clone, V> BPTree<'a, R, K, V> {
     pub fn contains(&mut self, key: &K) -> Result<bool, DecodingError> {
         Ok(self.offset_for(key)?.is_some())
     }
