@@ -236,8 +236,11 @@ impl<K: serde::de::DeserializeOwned+Eq+Ord+Clone> Node<K> {
         else {
             let needs_split = self.children[target].get_mut(reader)?.insert_nonroot(reader, key, value, split_threshold)?;
             if let Some((k, n)) = needs_split {
+                // This makes the new key "our" new maximum.
                 self.keys.insert(target, k);
-                self.children.insert(target, NodeRef::from_boxed_node(n));
+                // The new node is between the new key and the one after it; note the +1.
+                // This works because no node is permitted to have less than 2 children.
+                self.children.insert(target+1, NodeRef::from_boxed_node(n));
             }
         }
         if self.children.len() > split_threshold {
@@ -245,7 +248,6 @@ impl<K: serde::de::DeserializeOwned+Eq+Ord+Clone> Node<K> {
         }
         else { Ok(None) }   
     }
-
 }
 
 struct BPTree<'a, R: 'a, K, V> {
