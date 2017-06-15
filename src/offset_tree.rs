@@ -1,44 +1,7 @@
 use std;
-use std::io::{self, Read, Seek, Write};
-use std::error::Error;
-use std::cell;
-use bincode;
 use serde;
-
-
-#[derive(Debug)]
-pub enum DecodingError {
-    Corrupt(String),
-    IoError(io::Error),
-}
-
-fn decode<O: serde::de::DeserializeOwned, R: Read+Seek>(reader: &mut R, offset: u64) -> Result<O, DecodingError> {
-    reader.seek(io::SeekFrom::Start(offset)).map_err(|x| DecodingError::IoError(x))?;
-    bincode::deserialize_from(    reader, bincode::Infinite)
-    .map_err(|x| {
-        match *x {
-            bincode::ErrorKind::IoError(y) => DecodingError::IoError(y),
-            _ => DecodingError::Corrupt(x.description().to_string()),
-        }
-    })
-}
-
-#[derive(Debug)]
-pub enum EncodingError {
-    Unknown(String),
-    IoError(io::Error),
-}
-
-fn encode<O: serde::Serialize, W: Write+Seek>(writer: &mut W, obj: &O) -> Result<u64, EncodingError> {
-    let offset = writer.seek(io::SeekFrom::End(0)).map_err(|x| EncodingError::IoError(x))?;
-    bincode::serialize_into(writer, obj, bincode::Infinite)
-    .map_err(|x| {
-        match *x {
-            bincode::ErrorKind::IoError(y) => EncodingError::IoError(y),
-            _ => EncodingError::Unknown(x.description().to_string()),
-        }
-    }).map(|_| offset)
-}
+use std::cell;
+use storage_backend::StorageBackend;
 
 #[derive(Serialize, Deserialize, Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
 enum NodeType {
@@ -81,13 +44,13 @@ impl<K: serde::de::DeserializeOwned> From<DiskNode<K>> for Node<K> {
 }
 
 impl<K: serde::de::DeserializeOwned> DiskNode<K> {
-    fn load<R: Read+Seek>(reader: &mut R, offset: u64) -> Result<DiskNode<K>, DecodingError> {
-        decode(reader, offset)        
+    fn load<B: StorageBackend>(backend: &B, offset: u64) -> Result<DiskNode<K>, B::DecodingError> {
+        backend.load(offset)        
     }
 }
 
-fn load<K: serde::de::DeserializeOwned, R: Read+Seek>(reader: &mut R, offset: u64) -> Result<Node<K>, DecodingError> {
-    Ok(DiskNode::<K>::load(reader, offset)?.into())
+fn load<K: serde::de::DeserializeOwned, B: StorageBackend>(backend: &B, offset: u64) -> Result<Node<K>, B::DecodingError> {
+    Ok(DiskNode::<K>::load(backend, offset)?.into())
 }
 
 impl<K: serde::de::DeserializeOwned> NodeRef<K> {
@@ -99,18 +62,18 @@ impl<K: serde::de::DeserializeOwned> NodeRef<K> {
         NodeRef(cell::UnsafeCell::new(NodeRefInternal::Loaded(node)))
     }
 
-    fn load<R: Read+Seek>(&self, reader: &mut R) -> Result<(), DecodingError> {
+    fn load<B: StorageBackend>(&self, backend: &B) -> Result<(), B::DecodingError> {
         let internal = self.0.get();
         unsafe {
-            if let NodeRefInternal::Unloaded(offset) = *internal {
-                *internal = NodeRefInternal::Loaded(Box::new(load(reader, offset)?));
+            if let &NodeRefInternal::Unloaded(offset) = &*internal {
+                *internal = NodeRefInternal::Loaded(Box::new(load(backend, offset)?));
             }
         }
         Ok(())
     }
 
-    fn get<R: Read+Seek>(&self, reader: &mut R) -> Result<&Node<K>, DecodingError> {
-        self.load(reader)?;
+    fn get<B: StorageBackend>(&self, backend: &B) -> Result<&Node<K>, B::DecodingError> {
+        self.load(backend)?;
         unsafe {
             Ok(match *self.0.get() {
                 NodeRefInternal::Loaded(ref n) => n,
@@ -119,8 +82,8 @@ impl<K: serde::de::DeserializeOwned> NodeRef<K> {
         }
     }
 
-    fn get_mut<R: Read+Seek>(&mut self, reader: &mut R) -> Result<&mut Node<K>, DecodingError> {
-        self.load(reader)?;
+    fn get_mut<B: StorageBackend>(&mut self, backend: &B) -> Result<&mut Node<K>, B::DecodingError> {
+        self.load(backend)?;
         unsafe {
             Ok(match *self.0.get() {
                 NodeRefInternal::Loaded(ref mut n) => {
@@ -142,45 +105,35 @@ impl<K: serde::de::DeserializeOwned> NodeRef<K> {
         }
     }
 
-    fn into_box<R: Read+Seek>(self, reader: &mut R) -> Result<Box<Node<K>>, DecodingError> {
-        self.load(reader)?;
-        let old = unsafe {
-            std::mem::replace(&mut *self.0.get(), NodeRefInternal::Unloaded(0))
+    fn into_box<B: StorageBackend>(self, backend: &B) -> Result<Box<Node<K>>, B::DecodingError> {
+        self.load(backend)?;
+        let ret = unsafe {
+            match std::ptr::read(self.0.get()) {
+                NodeRefInternal::Loaded(n) => Ok(n),
+                _ => panic!("Somehow, this is an unloaded node."),
+            }
         };
-        match old {
-            NodeRefInternal::Loaded(n) => Ok(n),
-            _ => panic!("Somehow, this is an unloaded node."),
-        }
-    }
-}
-
-impl<K> Drop for NodeRef<K> {
-    fn drop(&mut self) {
-        unsafe { std::ptr::drop_in_place(self.0.get()); }
+        std::mem::forget(self);
+        ret
     }
 }
 
 impl<K: serde::de::DeserializeOwned+Eq+Ord+Clone> Node<K> {
-    fn find_offset_for<R: Read+Seek>(&self, reader: &mut R, key: &K) -> Result<Option<u64>, DecodingError> {
+    fn find_offset_for<B: StorageBackend>(&self, backend: &B, key: &K) -> Result<Option<u64>, B::DecodingError> {
         if self.node_type == NodeType::Leaf {
-            if self.children.len() == 0 { return Ok(None) } //empty tree.
             match self.keys.binary_search(key) {
                 Ok(ind) => Ok(Some(self.children[ind].offset_or_panic("This is a leaf, but somehow has a loaded child."))),
                 Err(_) => Ok(None),
             }
         }
         else {
-            self.children[self.index_of(key)].get(reader)?.find_offset_for(reader, key)
+            self.children[self.index_of(key)].get(backend)?.find_offset_for(backend, key)
         }
     }
 
     fn index_of(&self, key: &K) -> usize{
         assert!(self.node_type != NodeType::Leaf);
         let ind = self.keys.binary_search(key);
-        // Explanation: this returns the index of the child to the right of the last key smaller than key.
-        // In this implementation, before is <= and after is >.
-        // Before is the index of the key, after is the index of the key+1.
-        // The not found case of binary_search is the key+1.
         match ind {
             Ok(index) | Err(index) => index,
         }
@@ -222,25 +175,32 @@ impl<K: serde::de::DeserializeOwned+Eq+Ord+Clone> Node<K> {
                 }
             }
         }
+        let d = if self.node_type == NodeType::Leaf { 0 } else { 1 };
+        assert_eq!(self.keys.len()+d, self.children.len());
+        assert_eq!(ret_node.keys.len()+d, ret_node.children.len());
+        assert!(self.keys.last().unwrap() <= &ret_key);
+        assert!(&ret_key < ret_node.keys.first().unwrap());
         (ret_key, Box::new(ret_node))
     }
 
-    fn insert_nonroot<R: Read+Seek>(&mut self, reader: &mut R, key: &K, value: u64, split_threshold: usize)
-        -> Result<Option<(K, Box<Node<K>>)>, DecodingError>
+    fn insert_nonroot<B: StorageBackend>(&mut self, backend: &B, key: &K, value: u64, split_threshold: usize)
+        -> Result<Option<(K, Box<Node<K>>)>, B::DecodingError>
     {
         assert!(self.node_type != NodeType::Root);
-        let target = self.index_of(key);
         if self.node_type == NodeType::Leaf {
-            if &self.keys[target] == key {
-                self.children[target] = NodeRef::from_offset(value);
-            }
-            else {
-                self.keys.insert(target, key.clone());
-                self.children.insert(target, NodeRef::from_offset(value));
+            match self.keys.binary_search(key) {
+                Ok(ind) => {
+                    self.children[ind] = NodeRef::from_offset(value);
+                },
+                Err(ind) => {
+                    self.keys.insert(ind, key.clone());
+                    self.children.insert(ind, NodeRef::from_offset(value));
+                }
             }
         }
         else {
-            let needs_split = self.children[target].get_mut(reader)?.insert_nonroot(reader, key, value, split_threshold)?;
+            let target = self.index_of(key);
+            let needs_split = self.children[target].get_mut(backend)?.insert_nonroot(backend, key, value, split_threshold)?;
             if let Some((k, n)) = needs_split {
                 // This makes the new key "our" new maximum.
                 self.keys.insert(target, k);
@@ -256,34 +216,45 @@ impl<K: serde::de::DeserializeOwned+Eq+Ord+Clone> Node<K> {
     }
 
     /// If the root splits, sets our type to internal and/or leaf depending, then returns the new sibling.
-    fn insert<R: Read+Seek>(&mut self, reader: &mut R, key: &K, value: u64, order: u64) -> Result<Option<(K, Box<Node<K>>)>, DecodingError> {
+    fn insert<B: StorageBackend>(&mut self, backend: &B, key: &K, value: u64, order: u64) -> Result<Option<(K, Box<Node<K>>)>, B::DecodingError> {
         let split_threshold = (order/2+order%2) as usize;
+        // Leaf is a special, short-circuiting case:
+        if self.node_type == NodeType::Leaf {
+            return self.insert_nonroot(backend, key, value, split_threshold);
+        }
         let target = self.index_of(key);
-        let needs_split = self.children[target].get_mut(reader)?.insert_nonroot(reader, key, value, split_threshold)?;
+        let needs_split = self.children[target].get_mut(backend)?.insert_nonroot(backend, key, value, split_threshold)?;
         if let Some((k, n)) = needs_split {
             // Same as insert_nonroot.
             self.keys.insert(target, k);
             self.children.insert(target+1, NodeRef::from_boxed_node(n));
         }
         if self.children.len() > split_threshold {
-            let new_type = match self.node_type {
-                NodeType::Leaf => NodeType::Leaf,
-                NodeType::Root => NodeType::Internal,
-                _ => panic!("Should be a root or a lweaf."),
-            };
-            self.node_type = new_type;
             Ok(Some(self.split_in_place()))
         }
         else { Ok(None) }
     }
 }
 
-struct OffsetTree<K> {
+pub struct OffsetTree<K> {
     root_reference: NodeRef<K>,
     order: u64,
 }
 
 impl<K: serde::de::DeserializeOwned+Eq+Ord+Clone> OffsetTree<K> {
+    pub fn empty(order: u64) -> OffsetTree<K> {
+        let initial_leaf = Box::new(Node {
+            modified: true,
+            node_type: NodeType::Leaf,
+            keys: vec![],
+            children: vec![],
+        });
+        OffsetTree {
+            root_reference: NodeRef::from_boxed_node(initial_leaf),
+            order,
+        }
+    }
+
     pub fn from_root_offset(offset: u64, order: u64) -> OffsetTree<K> {
         OffsetTree {
             root_reference: NodeRef::from_offset(offset),
@@ -291,20 +262,20 @@ impl<K: serde::de::DeserializeOwned+Eq+Ord+Clone> OffsetTree<K> {
         }
     }
 
-    pub fn contains<R: Read+Seek>(&mut self, reader: &mut R, key: &K) -> Result<bool, DecodingError> {
-        Ok(self.offset_for(reader, key)?.is_some())
+    pub fn contains<B: StorageBackend>(&mut self, backend: &B, key: &K) -> Result<bool, B::DecodingError> {
+        Ok(self.offset_for(backend, key)?.is_some())
     }
 
-    pub fn offset_for<R: Read+Seek>(&mut self, reader: &mut R, key: &K) -> Result<Option<u64>, DecodingError> {
-        self.root_reference.get(reader)?.find_offset_for(reader, key)
+    pub fn offset_for<B: StorageBackend>(&mut self, backend: &B, key: &K) -> Result<Option<u64>, B::DecodingError> {
+        self.root_reference.get(backend)?.find_offset_for(backend, key)
     }
 
-    pub fn insert<R: Read+Seek>(&mut self, reader: &mut R, key: &K, value: u64) -> Result<(), DecodingError> {
-        let needs_split = self.root_reference.get_mut(reader)?.insert(reader, key, value, self.order)?;
+    pub fn insert<B: StorageBackend>(&mut self, backend: &B, key: &K, value: u64) -> Result<(), B::DecodingError> {
+        let needs_split = self.root_reference.get_mut(backend)?.insert(backend, key, value, self.order)?;
         if let Some((k, right)) = needs_split {
             // This is a hack to get around moving out.
             let r = std::mem::replace(&mut self.root_reference, NodeRef::from_offset(0));
-            let left = r.into_box(reader)?;
+            let left = r.into_box(backend)?;
             let new_node = Node {
                 node_type: NodeType::Root,
                 modified: true,

@@ -7,4 +7,6 @@ extern crate take_mut;
 
 
 pub mod offset_tree;
+pub mod storage_backend;
+pub use storage_backend::StorageBackend;
 
